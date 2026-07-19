@@ -63,10 +63,11 @@ except:
     qStyleHint_TypeWriter = QFont.TypeWriter
 
 from calibre.constants import islinux, isosx, iswindows
+from calibre.ebooks.BeautifulSoup import BeautifulSoup
 
 from calibre_plugins.annotations.common_utils import (
     BookStruct, HelpView, SizePersistedDialog,
-    get_clippings_cid, get_icon)
+    get_cc_mapping, get_clippings_cid, get_icon)
 
 from calibre_plugins.annotations.config import plugin_prefs
 from calibre_plugins.annotations.reader_app_support import ReaderApp
@@ -111,6 +112,7 @@ class MarkupTableModel(QAbstractTableModel):
         self.CONFIDENCE_COL = parent.CONFIDENCE_COL
         self.ENABLED_COL = parent.ENABLED_COL
         self.LAST_ANNOTATION_COL = parent.LAST_ANNOTATION_COL
+        self.NEW_ANNOTATIONS_COL = parent.NEW_ANNOTATIONS_COL
         self.READER_APP_COL = parent.READER_APP_COL
         self.TITLE_COL = parent.TITLE_COL
 
@@ -125,6 +127,9 @@ class MarkupTableModel(QAbstractTableModel):
         if not index.isValid():
             return ''
         elif role == qItemDataRole_BackgroundRole and self.show_confidence_colors:
+            has_new_annotations = self.arraydata[row][self.NEW_ANNOTATIONS_COL]
+            if not has_new_annotations:
+                return QBrush(QColor(225, 225, 225))
             confidence = self.arraydata[row][self.CONFIDENCE_COL]
             saturation = 0.40
             value = 1.0
@@ -277,10 +282,15 @@ class AnnotatedBooksDialog(SizePersistedDialog):
             if 'News' in genres and collect_news_clippings:
                 # cid = get_clippings_cid(self, news_clippings_destination)
                 confidence = 5
+                cid = get_clippings_cid(parent, news_clippings_destination)
             else:
                 confidence = book_data.get('confidence', None)
                 if confidence is None:
                     cid, confidence = parent.generate_confidence(book_data)
+                else:
+                    cid = book_data.get('cid', None)
+
+            has_new_annotations = self.has_new_annotations(parent, book_data, cid, confidence)
 
             # List order matches self.annotations_header
             this_book = [
@@ -293,20 +303,22 @@ class AnnotatedBooksDialog(SizePersistedDialog):
                 author,
                 last_annotation,
                 book_data['annotations'],
-                confidence
+                confidence,
+                has_new_annotations
                 ]
             self.tabledata.append(this_book)
 
         self.tv = QTableView(self)
         self.l.addWidget(self.tv)
         self.annotations_header = ['uuid', 'book_id', 'genre', '', _('Reader App'), _('Title'),
-                                   _('Author'), _('Last Annotation'), _('Annotations'), _('Confidence')]
+                                   _('Author'), _('Last Annotation'), _('Annotations'), _('Confidence'), 'has_new_annotations']
         self.ENABLED_COL = 3
         self.READER_APP_COL = 4
         self.TITLE_COL = 5
         self.AUTHOR_COL = 6
         self.LAST_ANNOTATION_COL = 7
         self.CONFIDENCE_COL = 9
+        self.NEW_ANNOTATIONS_COL = 10
         columns_to_center = [8]
         self.tm = MarkupTableModel(self, columns_to_center=columns_to_center)
         self.tv.setModel(self.tm)
@@ -330,6 +342,7 @@ class AnnotatedBooksDialog(SizePersistedDialog):
         self.tv.hideColumn(self.annotations_header.index('book_id'))
         self.tv.hideColumn(self.annotations_header.index('genre'))
         self.tv.hideColumn(self.CONFIDENCE_COL)
+        self.tv.hideColumn(self.NEW_ANNOTATIONS_COL)
 
         # Set horizontal self.header props
         self.tv.horizontalHeader().setStretchLastSection(True)
@@ -391,6 +404,31 @@ class AnnotatedBooksDialog(SizePersistedDialog):
 
         # Cause our dialog size to be restored from prefs or created on first usage
         self.resize_dialog()
+
+    def has_new_annotations(self, parent, book_data, cid, confidence):
+        if cid is None or confidence == 0:
+            return True
+
+        annotations_db = ReaderApp.generate_annotations_db_name(book_data['reader_app'], self.source)
+        new_soup = BeautifulSoup(self.get_annotations_as_HTML(annotations_db, book_data))
+        new_hashes = set([ua.get('hash') for ua in new_soup.findAll('div', 'annotation') if ua.get('hash')])
+        if not new_hashes:
+            return False
+
+        library_db = self.opts.gui.current_db
+        update_field = get_cc_mapping('annotations', 'field', 'Comments')
+        if update_field == 'Comments':
+            stored = library_db.comments(cid, index_is_id=True)
+        else:
+            mi = library_db.get_metadata(cid, index_is_id=True)
+            user_metadata = mi.get_user_metadata(update_field, False)
+            stored = user_metadata.get('#value#') if user_metadata else None
+        if not stored:
+            return True
+
+        old_soup = BeautifulSoup(stored)
+        old_hashes = set([ua.get('hash') for ua in old_soup.findAll('div', 'annotation') if ua.get('hash')])
+        return bool(new_hashes.difference(old_hashes))
 
     def capture_sort_column(self, sort_column):
         sort_order = 0 if self.tv.horizontalHeader().sortIndicatorOrder() == qSortOrder_AscendingOrder else 1
