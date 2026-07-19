@@ -8,7 +8,7 @@ __license__ = 'GPL v3'
 __copyright__ = '2013, Greg Riker <griker@hotmail.com>, 2014-2020 additions by David Forrester <davidfor@internode.on.net>'
 __docformat__ = 'restructuredtext en'
 
-import imp, inspect, os, re, sys, tempfile, threading, types
+import inspect, os, re, sys, tempfile, threading, types
 
 # calibre Python 3 compatibility.
 try:
@@ -51,6 +51,7 @@ from calibre.utils.config import config_dir
 from calibre_plugins.annotations.annotated_books import AnnotatedBooksDialog
 from calibre_plugins.annotations.annotations import merge_annotations, merge_annotations_with_comments
 from calibre_plugins.annotations.annotations_db import AnnotationsDB
+from calibre_plugins.annotations.compat_import import load_source_module
 
 from calibre_plugins.annotations.common_utils import (
     CoverMessageBox, HelpView, ImportAnnotationsTextDialog, ImportAnnotationsFileDialog, IndexLibrary,
@@ -355,12 +356,27 @@ class AnnotationsAction(InterfaceAction, Logger):
         if annotated_book_list:
             self.fetch_device_annotations(annotated_book_list, self.ios.device_name)
 
-    def fetch_usb_connected_device_annotations(self):
+    def fetch_usb_connected_device_annotations(self, full_scan=False):
         self._log_location("Start")
         if self.connected_device is not None:
             self._log_location("Have device")
             self.launch_library_scanner()
-            self.fetch_usb_device_annotations(self.get_connected_device_primary_name())
+            self.fetch_usb_device_annotations(self.get_connected_device_reader_app(), full_scan=full_scan)
+
+    def fetch_usb_connected_device_annotations_full_scan(self):
+        self.fetch_usb_connected_device_annotations(full_scan=True)
+
+    def get_connected_device_reader_app(self):
+        usb_reader_classes = USBReader.get_usb_reader_classes()
+        primary_name = self.get_connected_device_primary_name()
+        if primary_name in usb_reader_classes:
+            return primary_name
+
+        device = self.connected_device
+        if self.is_connected_mtp_kindle(device) and 'Kindle' in usb_reader_classes:
+            return 'Kindle'
+
+        return primary_name
 
     def get_connected_device_primary_name(self):
         if self.connected_device.name == 'MTP Device Interface':
@@ -372,13 +388,53 @@ class AnnotationsAction(InterfaceAction, Logger):
             import re
             if re.compile(r"^(Nova|Poke|Note|MAX)").match(device_name):
                 device_name = 'Boox'
+            elif self.is_connected_mtp_kindle(self.connected_device):
+                device_name = 'Kindle'
         else:
             # non-Android devices have dedicated drivers
             device_name = self.connected_device.name
 
         return device_name.split()[0]
 
-    def fetch_usb_device_annotations(self, reader_app):
+    def is_connected_mtp_kindle(self, device):
+        if device is None or getattr(device, 'name', None) != 'MTP Device Interface':
+            return False
+        if getattr(device, 'is_kindle', False):
+            return True
+        if getattr(device, 'current_vid', None) == 0x1949:
+            return True
+        names = (
+            getattr(device, 'current_friendly_name', ''),
+            getattr(device, 'gui_name', ''),
+        )
+        return any('kindle' in unicode(name).lower() for name in names if name)
+
+    def log_connected_device_diagnostics(self, usb_reader_classes, reader_app=None):
+        device = self.connected_device
+        if device is None:
+            self._log("connected_device diagnostics: no connected_device")
+            return
+        attrs = {}
+        for attr in (
+                'name', 'gui_name', 'current_friendly_name', 'is_kindle',
+                'current_vid', 'current_pid', 'VENDOR_ID', 'PRODUCT_ID',
+                '_main_id', '_carda_id', '_cardb_id', '_main_prefix',
+                '_card_a_prefix', '_card_b_prefix'):
+            try:
+                attrs[attr] = getattr(device, attr)
+            except Exception as e:
+                attrs[attr] = '<error: {0}>'.format(e)
+        self._log("connected_device diagnostics: attrs={0}".format(attrs))
+        self._log("connected_device diagnostics: reader_app={0}, known_usb_readers={1}, is_mtp_kindle={2}".format(
+            reader_app, sorted(usb_reader_classes), self.is_connected_mtp_kindle(device)))
+        if hasattr(device, 'filesystem_cache'):
+            try:
+                storage_names = [getattr(storage, 'name', None) for storage in device.filesystem_cache.entries]
+            except Exception as e:
+                storage_names = '<error: {0}>'.format(e)
+            self._log("connected_device diagnostics: mtp_storage_names={0}".format(storage_names))
+
+    def fetch_usb_device_annotations(self, reader_app, full_scan=False):
         """
         Selectively import annotations from books on mounted USB device
         """
@@ -404,7 +460,11 @@ class AnnotationsAction(InterfaceAction, Logger):
         self.opts.pb.set_label(_("Fetch annotations from USB device"))
         self.opts.pb.set_value(0)
         self.opts.pb.show()
-        annotated_book_list = self.get_annotated_books_on_usb_device(reader_app)
+        self.opts['full_device_scan'] = full_scan
+        try:
+            annotated_book_list = self.get_annotated_books_on_usb_device(reader_app)
+        finally:
+            self.opts['full_device_scan'] = False
         self._log_location("DEBUG: %s" % annotated_book_list)
         self.opts.pb.hide()
         self.fetch_device_annotations(annotated_book_list, self.opts.device_name)
@@ -885,6 +945,15 @@ class AnnotationsAction(InterfaceAction, Logger):
         '''
         self._log_location()
 
+        def register_usb_readers_from_module(module, source_name):
+            registered = []
+            for value in module.__dict__.values():
+                if isinstance(value, type) and issubclass(value, USBReader) and value is not USBReader:
+                    USBReader.register_usb_reader_class(value)
+                    registered.append(value.app_name)
+            if registered:
+                self._log(" registered USB reader classes from '{0}': {1}".format(source_name, sorted(registered)))
+
         # Load the builtin classes
         folder = 'readers/'
         reader_app_classes = get_resource_files(self.plugin_path, folder=folder)
@@ -900,8 +969,15 @@ class AnnotationsAction(InterfaceAction, Logger):
             with open(tmp_file, 'wb') as tf:
                 tf.write(get_resources(rac))
             self._log(" loading built-in class '%s'" % name)
-            imp.load_source(name, tmp_file)
-            os.remove(tmp_file)
+            try:
+                module = load_source_module(name, tmp_file)
+                register_usb_readers_from_module(module, name)
+            except Exception:
+                import traceback
+                self._log(" unable to load built-in class '{0}'".format(name))
+                self._log(traceback.format_exc())
+            finally:
+                os.remove(tmp_file)
 
         # Load locally defined classes specified in config file
         additional_readers = plugin_prefs.get('additional_readers', None)
@@ -916,7 +992,8 @@ class AnnotationsAction(InterfaceAction, Logger):
                     name = re.sub('_', '', name)
                     self._log(" loading external class '%s'" % name)
                     try:
-                        imp.load_source(name, ac)
+                        module = load_source_module(name, ac)
+                        register_usb_readers_from_module(module, name)
                     except:
                         # If additional_class fails to import, exit
                         import traceback
@@ -1269,8 +1346,9 @@ class AnnotationsAction(InterfaceAction, Logger):
 
                 else:
                     usb_reader_classes = list(USBReader.get_usb_reader_classes().keys())
-                    primary_name = self.get_connected_device_primary_name()
-                    if primary_name in usb_reader_classes:
+                    reader_app = self.get_connected_device_reader_app()
+                    self.log_connected_device_diagnostics(usb_reader_classes, reader_app=reader_app)
+                    if reader_app in usb_reader_classes:
                         haveDevice = True
                         fetch_tootip = _('Fetch annotations from {0}').format(self.connected_device.gui_name)
 #                         ac = self.create_menu_item_ex(
@@ -1291,6 +1369,17 @@ class AnnotationsAction(InterfaceAction, Logger):
                             triggered=self.fetch_usb_connected_device_annotations,
                             enabled=haveDevice
                             )
+            if self.connected_device and self.is_connected_mtp_kindle(self.connected_device):
+                ac = self.create_menu_item_ex(
+                                m,
+                                'Fetch annotations from connected device with full scan',
+                                _('Fetch annotations from connected device (full scan)'),
+                                image=get_icon('images/device.png'),
+                                tooltip=_('Fetch annotations from Kindle and scan all visible Kindle book files. This can take several minutes.'),
+                                shortcut=(),
+                                triggered=self.fetch_usb_connected_device_annotations_full_scan,
+                                enabled=haveDevice
+                                )
 #             ac.setVisible(False)
             m.addSeparator()
 

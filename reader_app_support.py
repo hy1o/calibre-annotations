@@ -29,6 +29,7 @@ from calibre.gui2 import error_dialog
 from calibre.utils.filenames import shorten_components_to
 from calibre.ptempfile import PersistentTemporaryDirectory
 from calibre.utils.zipfile import ZipFile
+from calibre_plugins.annotations.device_compat import device_adapter_for
 
 from calibre.utils.config import JSONConfig
 plugin_prefs = JSONConfig('plugins/annotations')
@@ -126,6 +127,8 @@ class ReaderApp(object):
         """
         Perform device-specific shutdown
         """
+        if getattr(self, 'device_adapter', None) is not None:
+            self.device_adapter.close()
         pass
 
     def commit(self):
@@ -399,6 +402,8 @@ class ExportingReader(ReaderApp):
         self.annotations_db = None
         self.app_name_ = re.sub(' ', '_', self.app_name)
         self.books_db = None
+        self.device = getattr(self.opts.gui.device_manager, 'device', None)
+        self.device_adapter = device_adapter_for(self.device) if self.device is not None else None
         self.installed_books = []
         self.mount_point = None
         if hasattr(self.opts, 'mount_point'):
@@ -427,6 +432,8 @@ class iOSReaderApp(ReaderApp):
         self.annotations_db = None
         self.app_name_ = re.sub(' ', '_', self.app_name)
         self.books_db = None
+        self.device = getattr(self.opts.gui.device_manager, 'device', None)
+        self.device_adapter = device_adapter_for(self.device) if self.device is not None else None
         self.installed_books = []
         self.ios = None
         if hasattr(parent.opts, 'ios'):
@@ -741,6 +748,8 @@ class USBReader(ReaderApp):
         self.annotations_db = None
         self.app_name_ = re.sub(' ', '_', self.app_name)
         self.books_db = None
+        self.device = getattr(self.opts.gui.device_manager, 'device', None)
+        self.device_adapter = device_adapter_for(self.device) if self.device is not None else None
         self.installed_books = []
         self.mount_point = None
         if hasattr(self.opts, 'mount_point'):
@@ -784,8 +793,11 @@ class USBReader(ReaderApp):
             path_map = {}
             for id in ids:
                 path = get_device_path_from_id(id)
+                if not path:
+                    self._log(" no device path found for library id={0}; skipping path-map entry".format(id))
+                    continue
                 mi = db.get_metadata(id, index_is_id=True)
-                a_path = self.device.create_annotations_path(mi, device_path=path)
+                a_path = self.device_adapter.create_annotations_path(mi, device_path=path)
                 path_map[id] = dict(path=a_path, fmts=get_formats(id))
             return path_map
 
@@ -804,14 +816,7 @@ class USBReader(ReaderApp):
         return path_map
 
     def get_storage(self):
-        storage = []
-        if self.device._main_prefix:
-            storage.append(os.path.join(self.device._main_prefix, self.device.EBOOK_DIR_MAIN))
-        if self.device._card_a_prefix:
-            storage.append(os.path.join(self.device._card_a_prefix, self.device.EBOOK_DIR_CARD_A))
-        if self.device._card_b_prefix:
-            storage.append(os.path.join(self.device._card_b_prefix, self.device.EBOOK_DIR_CARD_B))
-        return storage
+        return self.device_adapter.get_storage_paths()
 
     @staticmethod
     def get_usb_reader_classes():
@@ -826,6 +831,13 @@ class USBReader(ReaderApp):
                     known_usb_reader_classes[c.app_name] = c
             USBReader.usb_reader_classes = known_usb_reader_classes
         return USBReader.usb_reader_classes
+
+    @staticmethod
+    def register_usb_reader_class(reader_class):
+        if USBReader.usb_reader_classes is None:
+            USBReader.get_usb_reader_classes()
+        if getattr(reader_class, 'SUPPORTS_FETCHING', False):
+            USBReader.usb_reader_classes[reader_class.app_name] = reader_class
 
     @staticmethod
     def _iter_subclasses(cls, _seen=None):

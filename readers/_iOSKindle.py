@@ -9,11 +9,9 @@ __copyright__ = '2013, Greg Riker <griker@hotmail.com>'
 __docformat__ = 'restructuredtext en'
 
 import os, re, sqlite3
+from io import BytesIO
 
-from cStringIO import StringIO
-
-from calibre.ebooks.BeautifulSoup import UnicodeDammit
-
+from calibre_plugins.annotations.compat_text import UnicodeDammit
 from calibre_plugins.annotations.reader_app_support import iOSReaderApp
 from calibre_plugins.annotations.common_utils import (AnnotationStruct, BookStruct,
     UnknownAnnotationTypeException)
@@ -305,7 +303,7 @@ class KindleReaderApp(iOSReaderApp):
             mi = {'uuid': None, 'genre': None}
             mobi_file = None
             with open(os.path.join(self.mount_point, path), 'rb') as f:
-                stream = StringIO(f.read())
+                stream = BytesIO(f.read())
                 mobi_file = MetadataUpdater(stream)
             if 105 in mobi_file.original_exth_records:
                 mi['genre'] = mobi_file.original_exth_records[105]
@@ -314,5 +312,5 @@ class KindleReaderApp(iOSReaderApp):
             return mi
 
         from calibre.ebooks.metadata.mobi import get_metadata
-        f = StringIO(self.ios.read(path, mode='rb'))
+        f = BytesIO(self.ios.read(path, mode='rb'))
         return get_metadata(f)

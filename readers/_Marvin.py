@@ -12,9 +12,9 @@ import os, re, sqlite3
 
 from lxml import etree, html
 
-from calibre.ebooks.BeautifulSoup import UnicodeDammit
 from calibre.gui2 import Application
 
+from calibre_plugins.annotations.compat_text import UnicodeDammit
 from calibre_plugins.annotations.reader_app_support import iOSReaderApp
 from calibre_plugins.annotations.common_utils import (AnnotationStruct, BookStruct,
     get_clippings_cid)
@@ -536,4 +536,3 @@ class MarvinReaderApp(iOSReaderApp):
             return fmt_str % tuple(full_ladder)
         except:
             return False
-

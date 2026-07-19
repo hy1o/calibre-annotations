@@ -8,7 +8,7 @@ __license__ = 'GPL v3'
 __copyright__ = '2013, Greg Riker <griker@hotmail.com>'
 __docformat__ = 'restructuredtext en'
 
-import glob, os, re
+import os, re
 
 from time import localtime, mktime
 
@@ -151,12 +151,17 @@ class KindleReaderApp(USBReader):
         
 
         self.device = self.opts.gui.device_manager.device
-        path_map = self.get_path_map()
-        self._log("path_map=%s" % path_map)
+        is_mtp_device = hasattr(self.device, 'filesystem_cache')
+        if is_mtp_device:
+            resolved_path_map = {}
+            self._log("Skipping USBMS path_map generation for MTP Kindle")
+        else:
+            path_map = self.get_path_map()
+            self._log("path_map=%s" % path_map)
 
-        # Get books added to Kindle by calibre
-        resolved_path_map = self._get_installed_books(path_map)
-        self._log("After getting installed books: resolved_path_map=%s" % resolved_path_map)
+            # Get books added to Kindle by calibre
+            resolved_path_map = self._get_installed_books(path_map)
+            self._log("After getting installed books: resolved_path_map=%s" % resolved_path_map)
 
 
         self._log("###########################################")
@@ -166,17 +171,25 @@ class KindleReaderApp(USBReader):
         resolved_path_map = {}
         db = self.opts.gui.library_view.model().db
         self.onDeviceIds = set(db.search_getting_ids('ondevice:True', None, sort_results=False, use_virtual_library=False))
+        self.opts.pb.set_label("Finding books Calibre recognizes on Kindle")
+        self.opts.pb.set_value(0)
+        self.opts.pb.set_maximum(len(self.onDeviceIds))
         for book_id in self.onDeviceIds:
             paths = self.get_device_paths_from_id(book_id)
             if len(paths) > 0:
                 resolved_path_map[book_id] = paths[0]
+            self.opts.pb.increment()
 
         self._log("After getting installed books: resolved_path_map=%s" % resolved_path_map)
 
 
-        # Add books added to Kindle by WhisperNet or download
-        resolved_path_map = self._get_imported_books(resolved_path_map)
-        self._log("After getting imported books: resolved_path_map=%s" % resolved_path_map)
+        # Add books added to Kindle by WhisperNet or download. On MTP this requires
+        # synchronous device metadata reads and can freeze Calibre for minutes.
+        if is_mtp_device and not self.opts.get('full_device_scan', False):
+            self._log("Skipping imported-book metadata scan for MTP Kindle")
+        else:
+            resolved_path_map = self._get_imported_books(resolved_path_map)
+            self._log("After getting imported books: resolved_path_map=%s" % resolved_path_map)
 
         self.books_db = self.generate_books_db_name(self.app_name_, self.opts.device_name)
 
@@ -197,8 +210,12 @@ class KindleReaderApp(USBReader):
         #  Add installed books to the database
         for book_id in resolved_path_map:
             try:
-                self._log("Getting metadata from book. path='%s'" % (resolved_path_map[book_id]))
-                mi = self._get_metadata(resolved_path_map[book_id])
+                if is_mtp_device and book_id >= 0:
+                    self._log("Getting metadata from calibre library. id='%s'" % (book_id))
+                    mi = db.get_metadata(book_id, index_is_id=True)
+                else:
+                    self._log("Getting metadata from book. path='%s'" % (resolved_path_map[book_id]))
+                    mi = self._get_metadata(resolved_path_map[book_id])
             except Exception as e:
                 self._log("Unable to get metadata from book. path='%s'" % (resolved_path_map[book_id]))
                 self._log(" Exception thrown was=%s" % (str(e)))
@@ -282,19 +299,11 @@ class KindleReaderApp(USBReader):
                     file_fmts.add(fmt)
 
                 for vol in storage:
-                    book_path = path_map[id]['path'].replace(os.path.abspath('/<storage>'), vol)
-                    self._log("resolve_paths. looking for book on device: book_path=%s" % (book_path))
-                    book_extensions = file_fmts.intersection(kindle_formats)
-                    found = False
-                    for extension in book_extensions:
-                        this_fmt = book_path.replace('bookmark', extension)
-                        self._log("resolve_paths. looking for book on device: this_fmt=%s" % (this_fmt))
-                        if os.path.exists(this_fmt):
-                            self._log("resolve_paths. found format: this_fmt=%s" % (this_fmt))
-                            resolved_path_map[id] = this_fmt
-                            found = True
-                            break
-                    if found:
+                    self._log("resolve_paths. looking for book on device storage=%s path=%s" % (vol, path_map[id]['path']))
+                    resolved = self.device_adapter.resolve_book_path(path_map[id]['path'], file_fmts, [vol], kindle_formats)
+                    if resolved:
+                        self._log("resolve_paths. found format: resolved=%s" % (resolved))
+                        resolved_path_map[id] = resolved
                         break
             return resolved_path_map
 
@@ -302,7 +311,7 @@ class KindleReaderApp(USBReader):
         return resolve_paths(storage, path_map)
 
     def _get_metadata(self, path):
-        mi = self.device.metadata_from_path(path)
+        mi = self.device_adapter.metadata_from_path(path)
         return mi
 
     def _get_my_clippings(self):
@@ -310,7 +319,7 @@ class KindleReaderApp(USBReader):
         for vol in storage:
             for filename in MY_CLIPPINGS_FILENAMES:
                 mc_path = os.path.join(vol, filename)
-                if os.path.exists(mc_path):
+                if self.device_adapter.exists(mc_path):
                     return mc_path
         return None
 
@@ -319,42 +328,52 @@ class KindleReaderApp(USBReader):
         Add books in top-level documents folder to path_map, possibly added by whispernet
         '''
         if self.parent.library_scanner.isRunning():
+            self.opts.pb.set_label("Waiting for Calibre library index")
             self.parent.library_scanner.wait()
 
         unrecognized_index = -1
         storage = self.get_storage()
         self._log("    List of storage devices - storage=%s" % (storage))
         uuid_map_keys = self.parent.library_scanner.uuid_map.keys() # Should help performances
+        candidates = []
         for vol in storage:
             templates = KINDLE_TEMPLATES
             for template in templates:
                 self._log("    Searching for books on vol=%s using template=%s" % (vol,template))
-                imported_books = glob.iglob(os.path.join(vol, template))
+                imported_books = list(self.device_adapter.glob(os.path.join(vol, template)))
+                candidates.extend(imported_books)
                 self._log("    List of books from glob - imported_books=%s" % (imported_books))
-                for path in imported_books:
-                    self._log("    Have possible book with path=%s" % (path))
-                    try:
-                        book_mi = self._get_metadata(path)
-                    except Exception as e:
-                        self._log("    Unable to get metadata from book. path=%s" % (path))
-                        self._log("    Exception thrown was=%s" % (str(e)))
-                        continue
 
-                    if 'News' in book_mi.tags:
-                        if self.collect_news_clippings:
-                            resolved_path_map[self.news_clippings_cid] = path
-                            continue
+        self.opts.pb.set_label("Scanning Kindle book files")
+        self.opts.pb.set_value(0)
+        self.opts.pb.set_maximum(len(candidates))
+        for path in candidates:
+            self._log("    Have possible book with path=%s" % (path))
+            try:
+                book_mi = self._get_metadata(path)
+            except Exception as e:
+                self._log("    Unable to get metadata from book. path=%s" % (path))
+                self._log("    Exception thrown was=%s" % (str(e)))
+                self.opts.pb.increment()
+                continue
 
-                    if book_mi.uuid in uuid_map_keys:
-                        self._log("    Have found book UUID - book_mi.uuid='%s'" % (book_mi.uuid))
-                        matched_id = self.parent.library_scanner.uuid_map[book_mi.uuid]['id']
-                        resolved_path_map[matched_id] = path
-                    else:
-                        self._log("    Did not find book UUID - book_mi.uuid='%s'" % (book_mi.uuid))
-                        if not path in resolved_path_map.values():
-                            self._log("    Book not already in resolved_path_map path=='%s'" % (path))
-                            resolved_path_map[unrecognized_index] = path
-                            unrecognized_index -= 1
+            if 'News' in book_mi.tags:
+                if self.collect_news_clippings:
+                    resolved_path_map[self.news_clippings_cid] = path
+                    self.opts.pb.increment()
+                    continue
+
+            if book_mi.uuid in uuid_map_keys:
+                self._log("    Have found book UUID - book_mi.uuid='%s'" % (book_mi.uuid))
+                matched_id = self.parent.library_scanner.uuid_map[book_mi.uuid]['id']
+                resolved_path_map[matched_id] = path
+            else:
+                self._log("    Did not find book UUID - book_mi.uuid='%s'" % (book_mi.uuid))
+                if not path in resolved_path_map.values():
+                    self._log("    Book not already in resolved_path_map path=='%s'" % (path))
+                    resolved_path_map[unrecognized_index] = path
+                    unrecognized_index -= 1
+            self.opts.pb.increment()
 
         return resolved_path_map
 
@@ -363,7 +382,12 @@ class KindleReaderApp(USBReader):
         def log(level, msg, self=self):
             self._log('ParseKindleMyClippingsTxt '+level+': '+msg)
         ParseKindleMyClippingsTxt.log = log
-        annos = ParseKindleMyClippingsTxt.FromFileName(self._get_my_clippings())
+        clippings_path = self._get_my_clippings()
+        if clippings_path is None:
+            self._log(" Unable to find Kindle My Clippings.txt")
+            return
+        with self.device_adapter.materialize_file(clippings_path) as local_clippings:
+            annos = ParseKindleMyClippingsTxt.FromFileName(local_clippings)
         self._log(" Number of entries retrieved from 'My Clippings.txt'=%d" % (len(annos)))
         self._log(" Dictionary of installed_books_by_title =%s" % (self.installed_books_by_title))
         self._log(" Keys/Titles of installed_books_by_title =%s" % (self.installed_books_by_title.keys()))
@@ -543,4 +567,3 @@ class KindleXRayReaderApp(KindleReaderApp):
     # is 'Kindle 2/3/4/Touch/PaperWhite Device Interface',
     # so app_name would be the first word, 'Kindle'
     app_name = 'KindleXRay'
-
