@@ -379,14 +379,18 @@ class AnnotationsAction(InterfaceAction, Logger):
         return primary_name
 
     def get_connected_device_primary_name(self):
-        if self.connected_device.name == 'MTP Device Interface':
+        if self.is_connected_crosspoint_reader(self.connected_device):
+            device_name = 'XTEINK'
+        elif self.connected_device.name == 'MTP Device Interface':
             self._log_location("get_connected_device_primary_name - Have MTP device - self.get_connected_device_primary_name='%s'" % self.connected_device.current_friendly_name)
             # get actual device name from the MTP driver (used for Android devices)
             device_name = self.connected_device.current_friendly_name
 
             # group all Onyx devices under same name, because they behave the same
             import re
-            if re.compile(r"^(Nova|Poke|Note|MAX)").match(device_name):
+            if re.compile(r"^(XTEINK|X4|X3)", re.I).match(device_name):
+                device_name = 'XTEINK'
+            elif re.compile(r"^(Nova|Poke|Note|MAX)").match(device_name):
                 device_name = 'Boox'
             elif self.is_connected_mtp_kindle(self.connected_device):
                 device_name = 'Kindle'
@@ -395,6 +399,19 @@ class AnnotationsAction(InterfaceAction, Logger):
             device_name = self.connected_device.name
 
         return device_name.split()[0]
+
+    def is_connected_crosspoint_reader(self, device):
+        if device is None:
+            return False
+        names = (
+            getattr(device, 'name', ''),
+            getattr(device, 'gui_name', ''),
+            getattr(device, 'description', ''),
+        )
+        if any('crosspoint reader' in unicode(name).lower() for name in names if name):
+            return True
+        model = unicode(getattr(device, 'device_model', '') or '').upper()
+        return model in ('X3', 'X4')
 
     def is_connected_mtp_kindle(self, device):
         if device is None or getattr(device, 'name', None) != 'MTP Device Interface':
@@ -408,31 +425,6 @@ class AnnotationsAction(InterfaceAction, Logger):
             getattr(device, 'gui_name', ''),
         )
         return any('kindle' in unicode(name).lower() for name in names if name)
-
-    def log_connected_device_diagnostics(self, usb_reader_classes, reader_app=None):
-        device = self.connected_device
-        if device is None:
-            self._log("connected_device diagnostics: no connected_device")
-            return
-        attrs = {}
-        for attr in (
-                'name', 'gui_name', 'current_friendly_name', 'is_kindle',
-                'current_vid', 'current_pid', 'VENDOR_ID', 'PRODUCT_ID',
-                '_main_id', '_carda_id', '_cardb_id', '_main_prefix',
-                '_card_a_prefix', '_card_b_prefix'):
-            try:
-                attrs[attr] = getattr(device, attr)
-            except Exception as e:
-                attrs[attr] = '<error: {0}>'.format(e)
-        self._log("connected_device diagnostics: attrs={0}".format(attrs))
-        self._log("connected_device diagnostics: reader_app={0}, known_usb_readers={1}, is_mtp_kindle={2}".format(
-            reader_app, sorted(usb_reader_classes), self.is_connected_mtp_kindle(device)))
-        if hasattr(device, 'filesystem_cache'):
-            try:
-                storage_names = [getattr(storage, 'name', None) for storage in device.filesystem_cache.entries]
-            except Exception as e:
-                storage_names = '<error: {0}>'.format(e)
-            self._log("connected_device diagnostics: mtp_storage_names={0}".format(storage_names))
 
     def fetch_usb_device_annotations(self, reader_app, full_scan=False):
         """
@@ -1347,7 +1339,6 @@ class AnnotationsAction(InterfaceAction, Logger):
                 else:
                     usb_reader_classes = list(USBReader.get_usb_reader_classes().keys())
                     reader_app = self.get_connected_device_reader_app()
-                    self.log_connected_device_diagnostics(usb_reader_classes, reader_app=reader_app)
                     if reader_app in usb_reader_classes:
                         haveDevice = True
                         fetch_tootip = _('Fetch annotations from {0}').format(self.connected_device.gui_name)
